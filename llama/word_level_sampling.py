@@ -547,15 +547,18 @@ class LLM_Word_Level_Ensemble:
                     should_continue = False
                 else:
                     should_continue = True
+            most_probable_gen_text = self.print_predictions( inputs_ids , inputs_log_prob , starting_batch_input_len ,skip=True )
             with open(log_file , 'a' ) as f:
                 f.write(f'\nThread_num:{thread_number} finished batch index: {index}\n')
                 f.write(f'{time.time()-start} \t gen_text_len:{inputs_ids.size(1)-starting_batch_input_len}\n')
-            most_probable_gen_text = self.print_predictions( inputs_ids , inputs_log_prob , starting_batch_input_len ,skip=True )
-            del inputs_ids; del inputs_log_prob; del batch_output; #torch.cuda.empty_cache()
-            with open(log_file , 'a' ) as f:
                 f.write(f'\nThe chosen gen text:  {most_probable_gen_text}\n')
+            del inputs_ids; del inputs_log_prob; del batch_output; #torch.cuda.empty_cache()
             print('The chosen gen text: ' , most_probable_gen_text, '\n')
             list_of_outputs.extend( most_probable_gen_text )
+        print(f'Thread Num: {thread_number}')
+        for i in self.device_list:
+            print(f'End of process | max {i}:  , {torch.cuda.max_memory_allocated(i)} ')
+        print('\n')
         return list_of_outputs
         
     def start_pipelines(self, batch_size , log_file , num_beam=1 , top_k=1 , max_num_token=200 ,  num_threads = 3):
