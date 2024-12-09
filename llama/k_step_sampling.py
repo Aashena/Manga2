@@ -299,18 +299,19 @@ class LLM_Word_Level_Ensemble:
         next_token_candidates_tensor[non_active_texts_index,:] = 0
         next_token_candidates_tensor[non_active_texts_index, self.tokenizer.eos_token_id ] = 1
         
-        topk_candidates_indexes = torch.topk(
-            next_token_candidates_tensor, k=top_k , dim=1 ).indices #shape( batch_size , top_k , num_beam)
+        #If we want to apply masking, the following block of code should be uncommented
+        # topk_candidates_indexes = torch.topk(
+        #     next_token_candidates_tensor, k=top_k , dim=1 ).indices #shape( batch_size , top_k , num_beam)
 
-        batch_indice_tensor = self.make_batch_indice_tensor(batch_size , top_k)
+        # batch_indice_tensor = self.make_batch_indice_tensor(batch_size , top_k)
 
-        masking_matrix = torch.zeros( ( next_token_candidates_tensor.size() ) ).to(self.device_list[-1])
-        masking_matrix[ batch_indice_tensor , topk_candidates_indexes ] = 1
+        # masking_matrix = torch.zeros( ( next_token_candidates_tensor.size() ) ).to(self.device_list[-1])
+        # masking_matrix[ batch_indice_tensor , topk_candidates_indexes ] = 1
         
         # Filter the token probabilities for the top k candidates.
-        topk_candidates_tensor_score = next_token_candidates_tensor * masking_matrix
+        topk_candidates_tensor_score = next_token_candidates_tensor #* masking_matrix
         
-        del sentences; torch.cuda.empty_cache()
+        # del sentences; torch.cuda.empty_cache()
         return topk_candidates_tensor_score , past_key_values #first output shape (batch_size , vocab_size)
         
 
@@ -545,9 +546,9 @@ class LLM_Word_Level_Ensemble:
 
                 gen_text_len = self.input_ids_to_gen_text_len(new_inputs_ids , starting_batch_input_len) #shape(batch_size , 1 , num_candidate_beams)
                 
-                # print('Candidate beams:')
-                # self.print_predictions( new_inputs_ids ,new_inputs_log_prob/gen_text_len , starting_batch_input_len)
-                # print('\n')
+                print('Candidate beams:')
+                self.print_predictions( new_inputs_ids ,new_inputs_log_prob/gen_text_len , starting_batch_input_len)
+                print('\n')
 
                 topk_object = torch.topk(-new_inputs_log_prob/(gen_text_len**0), k=num_beam , dim=-1 , largest=False )
                 inputs_log_prob_divided = -topk_object.values # shape (batch_size , 1 , num_beam)
