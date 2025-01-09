@@ -12,6 +12,8 @@ import inspect
 import ast
 from nltk.translate.bleu_score import sentence_bleu
 from nltk.tokenize import word_tokenize
+from collections import defaultdict , Counter
+import math
 
 class ThreadWithReturnValue(Thread):
     def __init__(self, group=None, target=None, name=None,
@@ -43,7 +45,6 @@ class LLM_Word_Level_Ensemble:
         self.tokenizer.padding_side="left"
         self.model.resize_token_embeddings(len(self.tokenizer))
         self.model.config.pad_token_id = self.tokenizer.pad_token_id # updating model config)
-        self.just_performed_ensemble = True # This variable shows if the ensemble is performed recently or not so that the model can continue and sample more tokens after the ensemble is performed
         print(f'loading the model into two GPUs: {self.device_list}')
 
         seq_in_gpu_device = torch.nn.Sequential( self.model.model.embed_tokens ).to(self.device_list[0])
@@ -76,6 +77,12 @@ class LLM_Word_Level_Ensemble:
         
         self.gpu_lock_list = [ Lock() for i in self.device_list]
         print('Model successfully loaded')
+
+        self.sql_keywords = [
+            "SELECT", "FROM", "WHERE", "GROUP BY", "HAVING", "ORDER BY", "LIMIT", "OFFSET",
+             "UNION", "WITH" , "INTERSECT" , "EXCEPT"
+        ]
+
         
     def get_layer_memory(self , layer):
         # Calculate the memory occupied by the parameters of the layer
@@ -326,23 +333,19 @@ class LLM_Word_Level_Ensemble:
             #sentences: torch tensor of size(batch size, input_len).
         #return:
             #torch tensor containing true or false stating if the sentecne has a reserved word or not
-        sql_keywords = [
-            "SELECT", "FROM", "WHERE", "GROUP BY", "HAVING", "ORDER BY", "LIMIT", "OFFSET",
-             "UNION", "WITH" , "INTERSECT" , "EXCEPT"
-        ]
         decoded_sentences = self.tokenizer.batch_decode( sentences , skip_special_tokens=False )
         output_list = []
         for sent in decoded_sentences:
             found_keyword = False
-            for keyword in sql_keywords:
+            for keyword in self.sql_keywords:
                 if sent.upper()[-(len(keyword)):] == keyword:
                     found_keyword = True
-                    print('found keyword')
+                    # print('found keyword')
                     break
             output_list.append(found_keyword)
         return torch.tensor( output_list ).to(sentences.device)
 
-    def get_next_word_score(self, sentences, past_key_values=None ,top_k=5):#operation_on_a_batch
+    def get_next_word_score(self, sentences, just_performed_ensemble, current_clause_length, past_key_values=None ,top_k=5):#operation_on_a_batch
         # Getting the word probabilities for the next word. It will have the probability for the top-k words, and it will zero out the rest. If the top_k argument is set to -1 then it will return the whole probability distribution.
         #Input:
             #sentences: torch tensor of size(batch size, input_len).
@@ -351,21 +354,26 @@ class LLM_Word_Level_Ensemble:
             #torch tensor. The vector containing the probability of top_k words for the next word. The rest of the words are zeroed out. shape(batch_size , vocab_size)
         
         batch_size = len(sentences)
-        print('batch_size: ' , batch_size)
+        # print('batch_size: ' , batch_size)
         next_token_candidates_tensor = torch.zeros( (batch_size , self.vocab_size) ).to(self.device_list[-1])
         last_tokens = sentences[:,-1]
-        active_texts_index = torch.nonzero( last_tokens!=self.tokenizer.eos_token_id ).reshape( (-1,) ).to('cpu')
+        
         non_active_texts_index = torch.nonzero( last_tokens==self.tokenizer.eos_token_id ).reshape( (-1,) ).to('cpu')
-
-        if active_texts_index.size(0)>0:
-            logits , past_key_values = self.get_predictions(sentences[active_texts_index,:] , 
-                                                            past_key_values= past_key_values) #shape(batch_size , vocab_size)
-            next_token_candidates_tensor[active_texts_index,:] = logits
 
         next_token_candidates_tensor[non_active_texts_index,:] = 0
         next_token_candidates_tensor[non_active_texts_index, self.tokenizer.eos_token_id ] = 1
-        if self.just_performed_ensemble == False:
-            reached_end_of_clause = torch.nonzero( self.check_if_start_of_clause(sentences) ).reshape( (-1,) ).to('cpu')
+        
+        if just_performed_ensemble == False:
+            current_clause_length +=1
+            is_waiting = self.check_if_start_of_clause(sentences)
+            # print(is_waiting)
+            # print(True in is_waiting)
+            is_active = torch.logical_and( torch.logical_not(is_waiting) , last_tokens!=self.tokenizer.eos_token_id )
+            if False not in is_active:
+                current_clause_length = 1
+            # print('current_clause_length: ' , current_clause_length)
+            active_texts_index = torch.nonzero( is_active ).reshape( (-1,) ).to('cpu')
+            reached_end_of_clause = torch.nonzero( is_waiting ).reshape( (-1,) ).to('cpu')
             next_token_candidates_tensor[reached_end_of_clause,:] = 0
             next_token_candidates_tensor[reached_end_of_clause, self.tokenizer.pad_token_id ] = 1
             # waiting_texts_index = torch.nonzero( last_tokens==self.tokenizer.pad_token_id ).reshape( (-1,) ).to('cpu')
@@ -373,7 +381,15 @@ class LLM_Word_Level_Ensemble:
             # next_token_candidates_tensor[waiting_texts_index,:] = 0
             # next_token_candidates_tensor[waiting_texts_index, self.tokenizer.pad_token_id ] = 1
         else:
-            self.just_performed_ensemble = False
+            current_clause_length = 1
+            active_texts_index = torch.nonzero( last_tokens!=self.tokenizer.eos_token_id ).reshape( (-1,) ).to('cpu')
+            just_performed_ensemble = False
+
+        if active_texts_index.size(0)>0:
+            logits , past_key_values = self.get_predictions(sentences[active_texts_index,:] , 
+                                                            past_key_values= past_key_values) #shape(batch_size , vocab_size)
+            next_token_candidates_tensor[active_texts_index,:] = logits
+        
         # print('active_texts_index: ' , active_texts_index)
         # print('non_active_texts_index: ' , non_active_texts_index)
         # print('reached_end_of_clause: ' , reached_end_of_clause)
@@ -391,7 +407,7 @@ class LLM_Word_Level_Ensemble:
         topk_candidates_tensor_score = next_token_candidates_tensor #* masking_matrix
         
         # del sentences; torch.cuda.empty_cache()
-        return topk_candidates_tensor_score , past_key_values #first output shape (batch_size , vocab_size)
+        return topk_candidates_tensor_score , past_key_values, just_performed_ensemble, current_clause_length #first output shape (batch_size , vocab_size)
         
 
     # import os.path
@@ -415,7 +431,7 @@ class LLM_Word_Level_Ensemble:
                 with open(potential_cache_file_name, 'rb') as f:
                     prompt_list = pkl.load(f)
             else:
-                dataset_path = directory + dataset + '/' + 'questions.json'
+                dataset_path = directory + dataset# + '/' + 'questions.json'
                 with open( dataset_path , 'r') as f:
                     dataset_file_byte = f.read()
                     dataset_json_format = json.loads(dataset_file_byte)
@@ -435,7 +451,59 @@ class LLM_Word_Level_Ensemble:
         self.number_of_prompts = datasets_prompts_array.shape[1]
         self.vocab_size = len(self.tokenizer)
         return len(self.all_prompts_in_1D)
+    
+    # from collections import defaultdict
+    def group_tokenized_responses(self, tokenized_responses, inputs_log_prob):
+        # Dictionary to group indices of identical tokenized responses
+        groups = defaultdict(list)
+
+        # Iterate over the tokenized responses with their indices
+        for i, tokens in enumerate(tokenized_responses):
+            # Convert tokens to a tuple (hashable) to use as a dictionary key
+            token_bag = frozenset(tokens)
+            groups[token_bag].append(i)
+
+        # Convert the grouped dictionary values into a list of groups
+        grouped_indices = list(groups.values())
+
+        # Calculate the average log probabilities for each group and assign them
+        for group in grouped_indices:
+            # Extract log probabilities for the current group
+            group_probs = [
+                inputs_log_prob[int(idx % self.number_of_components), 0, int(idx / self.number_of_components)].item()
+                for idx in group
+            ]
+
+            # Calculate the average probability for the group
+            avg_prob = np.mean(group_probs)
+
+            # Assign the average probability back to each index in the group
+            for idx in group:
+                inputs_log_prob[int(idx % self.number_of_components), 0, int(idx / self.number_of_components)] = avg_prob
+
+        return grouped_indices, inputs_log_prob
+
+    #calculating the similarity score of the two tokenized sentences.
+    def similarity_meassure(self, hypothesis_tokens , reference_tokens):
+
+        # hypothesis_tokens = [token for token in hypothesis_tokens if token.upper() not in self.sql_keywords]
+        # reference_tokens = [token for token in reference_tokens if token.upper() not in self.sql_keywords]
+
+        hypothesis_counts = Counter(hypothesis_tokens)
+        reference_counts = Counter(reference_tokens)
+        clipped_counts = dict()
+
+        for token in hypothesis_tokens:
+            if token not in reference_counts.keys():
+                reference_counts[token] = 0
+            clipped_counts[token] = min(hypothesis_counts[token], reference_counts[token])
         
+        total_clipped = sum(clipped_counts.values())
+
+        similarity = (total_clipped*2+1) / ( len(hypothesis_tokens) + len(reference_tokens) + 1 )
+        
+        return math.log(similarity)
+
     def ensemble_bleu(self, inputs_ids , inputs_log_prob , starting_batch_input_len , extra_added_paddings ):
         #function for performing ensemble using the bleu metric between the candidate sequences.
         #input:
@@ -445,6 +513,7 @@ class LLM_Word_Level_Ensemble:
         #return:
             #ensembled_inputs_ids: torch tensor with size (batch_size , input_len , num_beam)
             #ensembled_inputs_log_prob: torch tensor with size (batch_size , 1 , num_beam)
+        # print('extra_added_paddings before ensemble: ' , extra_added_paddings)
         batch_size = inputs_ids.size( dim=0 )
         num_beam = inputs_ids.size( dim=-1 )
         ensembled_inputs_ids = inputs_ids.clone()
@@ -453,30 +522,75 @@ class LLM_Word_Level_Ensemble:
             tokenized_responses = []
             decoded_text_list = []
             last_component = i + self.number_of_components
+            #Tokenizing the candidate sequences
             for j in range(num_beam):
-                decoded_text_list.extend( self.tokenizer.batch_decode( inputs_ids[ i:last_component , starting_batch_input_len: , j ] ,
-                                            skip_special_tokens=True ) )
+                components_token_list = []
+                for component in range(i,last_component,1):
+                    components_token_list.append( inputs_ids[ component ,
+                     int( starting_batch_input_len+extra_added_paddings[component,0,j].item() ): , j ] )
+                decoded_text_list.extend( self.tokenizer.batch_decode( components_token_list ,
+                                                skip_special_tokens=True ) )
             for text in decoded_text_list: #number of candidates we have for each question
-                tokenized_responses.append( word_tokenize( text ) )
-            blue_scores = []
-            for j in range( len( tokenized_responses ) ):
+                # print(text)
+                tokenized_responses.append( word_tokenize( text.replace('.' , ' ') ) )
+            score_list = []
+
+            #Finding the identical candidates, take the average of their probability, and only keep one of them with the average probability assigned to it.
+            grouped_indices, inputs_log_prob = self.group_tokenized_responses( tokenized_responses, inputs_log_prob)
+            gen_text_len = self.input_ids_to_gen_text_len(inputs_ids , starting_batch_input_len , extra_added_paddings) #shape(batch_size , 1 , num_candidate_beams)
+            tmp_input_log_prob = inputs_log_prob/(gen_text_len**0.1)
+
+            #Calculating the bleu metrics for each candidate
+            for j in range( len( tokenized_responses ) ): #[tok_component1_beam1, tok_component2_beam1, tok_component3_beam1, ..., tok_component1_beam2, tok_component2_beam2 , ...]
                 temp_tokenized_responses = tokenized_responses.copy()
                 tokenized_response = temp_tokenized_responses.pop(j)
-                blue_score = sentence_bleu( temp_tokenized_responses , tokenized_response )
-                blue_scores.append(blue_score)
+                score = 0
+                for index , other_response in enumerate(temp_tokenized_responses):
+                    if index>=j:
+                        index+=1
+                    # other_response_prob = torch.exp( inputs_log_prob[ int((index%self.number_of_components)+i) , 0,  int(index/self.number_of_components) ] )
+                    score_with_other_response = tmp_input_log_prob[ int((index%self.number_of_components)+i) , 0,  int(index/self.number_of_components) ] + self.similarity_meassure( tokenized_response, other_response )
+                    # score += self.similarity_meassure( tokenized_response, other_response ) * other_response_prob
+                    if score == 0:
+                        score = score_with_other_response
+                    else:
+                        alpha = max(score_with_other_response , score)
+                        beta = min(score_with_other_response , score)
+                        score = alpha + torch.log1p(torch.exp(beta-alpha))
+                # log_score = torch.log( score )#/ len(temp_tokenized_responses) )
+                log_score = (score + tmp_input_log_prob[ int((j%self.number_of_components)+i) , 0,  int(j/self.number_of_components) ] )#/2
+                # print(f'toknes:{tokenized_response} point:{score}')
+                score_list.append(log_score)
+            
+
+            for group in grouped_indices:
+                is_first_item = True
+                for index in group:
+                    if is_first_item ==False:
+                        score_list[index] = -100000
+                    else:
+                        is_first_item = False
+            # print('\nAfter grouping:\n')
+            # for j in range( len( tokenized_responses ) ): 
+            #     print(f'toknes:{tokenized_responses[j]} point:{score_list[j]}')
+
             selected_candidate_list = [] #containing tuples like (component_index , beam_index)
+            selected_candidate_ex_add_tok = [] #It shows the number of extra added tokens for each of the selected candidates
+            #Finding the sequence with the highest bleu score.
+            tmp_score_list = score_list.copy()
             for beam in range(num_beam):
-                max_bleu_score_value = max( blue_scores )
-                max_index_bleu_score = blue_scores.index(max_bleu_score_value)
-                blue_scores[ max_index_bleu_score ] = -100
+                max_bleu_score_value = max( tmp_score_list )
+                max_index_bleu_score = score_list.index(max_bleu_score_value)
+                tmp_score_list[ max_index_bleu_score ] = -100000
                 selected_candidate_list.append( ( int(max_index_bleu_score%self.number_of_components) , int(max_index_bleu_score/self.number_of_components) ) )
-            print('selected_candidate_list: ' , selected_candidate_list)
+                selected_candidate_ex_add_tok.append( extra_added_paddings[selected_candidate_list[beam][0]+i , 0 , selected_candidate_list[beam][1]].item() )
+            # print('selected_candidate_list: ' , selected_candidate_list)
             for component_index in range(self.number_of_components):
                 for beam_index in range(len(selected_candidate_list)):
-                    start_of_selected_gen_text = int(starting_batch_input_len + extra_added_paddings[selected_candidate_list[beam_index][0]+i , 0 , selected_candidate_list[beam_index][1]].item())
+                    start_of_selected_gen_text = int(starting_batch_input_len + selected_candidate_ex_add_tok[beam_index])
                     size_of_input_prompt = int(starting_batch_input_len + extra_added_paddings[i+component_index,0,beam_index].item())
                     index_diff = size_of_input_prompt - start_of_selected_gen_text
-                    extra_added_paddings[i+component_index,0,beam_index] = extra_added_paddings[selected_candidate_list[beam_index][0]+i , 0 , selected_candidate_list[beam_index][1]]
+                    extra_added_paddings[i+component_index,0,beam_index] = selected_candidate_ex_add_tok[beam_index]
                     if index_diff>0:
                         padding_tensor = torch.full( (index_diff,), self.tokenizer.pad_token_id, dtype=ensembled_inputs_ids.dtype, device=ensembled_inputs_ids.device)
                         ensembled_inputs_ids[i+component_index ,: , beam_index ]  = torch.cat( (ensembled_inputs_ids[i+component_index , index_diff: , beam_index ] , padding_tensor) )
@@ -486,8 +600,12 @@ class LLM_Word_Level_Ensemble:
                     ensembled_inputs_ids[i+component_index , 
                     start_of_selected_gen_text: , beam_index ] = inputs_ids[selected_candidate_list[beam_index][0]+i,
                                                                     start_of_selected_gen_text: , selected_candidate_list[beam_index][1] ]
-                    ensembled_inputs_log_prob[i+component_index , 0 , beam_index] = inputs_log_prob[selected_candidate_list[beam_index][0]+i,
-                                                                                    0, selected_candidate_list[beam_index][1]]
+                    # print(f'orig log prob: {inputs_log_prob[selected_candidate_list[beam_index][0]+i, 0, selected_candidate_list[beam_index][1]]}')
+                    # print(f'ensemble prob: {score_list[self.number_of_components * selected_candidate_list[beam_index][1] + selected_candidate_list[beam_index][0]]}')
+                    # ensembled_inputs_log_prob[i+component_index , 0 , beam_index] = ( inputs_log_prob[selected_candidate_list[beam_index][0]+i,
+                    #                                                                 0, selected_candidate_list[beam_index][1]] + score_list[self.number_of_components * selected_candidate_list[beam_index][1] + selected_candidate_list[beam_index][0]] )/2
+                    ensembled_inputs_log_prob[i+component_index , 0 , beam_index] = score_list[self.number_of_components * selected_candidate_list[beam_index][1] + selected_candidate_list[beam_index][0]]
+        # print('extra_added_paddings after ensemble: ' , extra_added_paddings)
         return ensembled_inputs_ids , ensembled_inputs_log_prob
 
     
@@ -542,16 +660,23 @@ class LLM_Word_Level_Ensemble:
         if input_prob is None:
             input_prob = torch.zeros( (inputs_ids.size(0) , 1 , inputs_ids.size(-1) ) )
         gen_text_list = []
+        gen_text_len_list = []
         for i  in range( 0 , inputs_ids.size(0) , self.number_of_components ):
             # print(f'Index in batch: {int( (i+1)/self.number_of_components )}')
-            start_of_first_beam = starting_batch_input_len + extra_added_paddings[i,0,0] #the start of the generated text for the first beam.
-            start_of_first_beam = int(start_of_first_beam.item())
-            input_text_list = self.tokenizer.batch_decode( inputs_ids[i,start_of_first_beam:,:].transpose( 0,1 ) ,
+            beams_batch = []
+            for beam in range(inputs_ids.size(-1)):
+                start_of_beam = starting_batch_input_len + extra_added_paddings[i,0,beam] #the start of the generated text for the beam.
+                start_of_beam = int(start_of_beam.item())
+                beams_batch.append(inputs_ids[i,start_of_beam:,beam])
+            input_text_list = self.tokenizer.batch_decode( beams_batch ,
                                                           skip_special_tokens=skip )
             gen_text_list.append( input_text_list[0] )
+            start_of_first_beam = starting_batch_input_len + extra_added_paddings[i,0,0] #the start of the generated text for the first beam.
+            gen_text_len_list.append( inputs_ids.size(1) - start_of_first_beam )
+            print('number of the component: ', i)
             for j in range( len(input_text_list) ):
                 print(f'Beam number {j}, prob={input_prob[i,0,j]} --> {input_text_list[j]} --> {inputs_ids[i,-1,j]}')
-        return gen_text_list
+        return gen_text_list, gen_text_len_list
 
 
     def input_ids_to_gen_text_len(self , input_ids , starting_batch_input_len , extra_added_paddings):
@@ -649,8 +774,11 @@ class LLM_Word_Level_Ensemble:
             for i in self.device_list:
                 print(f'Start of batch | max {i}:  , {torch.cuda.max_memory_allocated(i)} ')
             print('\n')
-            
+            number_of_clauses = 0
+            current_clause_length = 0
             past_key_values = None
+            max_clause_len = 50
+            just_performed_ensemble = True # This variable shows if the ensemble is performed recently or not so that the model can continue and sample more tokens after the ensemble is performed
             while should_continue:
                 gen_respond_len += 1
                 start_iteration = time.time()
@@ -662,9 +790,9 @@ class LLM_Word_Level_Ensemble:
                 inputs_ids = inputs_ids_ready_infer.reshape( (inputs_ids.size(0), inputs_ids.size(-1), -1 ) ).transpose(1 , 2)
             #     print( torchinfo.summary( self.model, input_data= inputs_ids_ready_infer ,batch_dim = 0, 
             # col_names = ('input_size', 'output_size', 'num_params', 'kernel_size', 'mult_adds'), device='cpu' , depth= 7) )
-                
-                batch_output , past_key_values = self.get_next_word_score( inputs_ids_ready_infer , past_key_values=past_key_values, top_k=top_k ) #(batch_size*num_beam , vocab_size)
 
+                batch_output , past_key_values, just_performed_ensemble, current_clause_length = self.get_next_word_score( inputs_ids_ready_infer , just_performed_ensemble, current_clause_length, past_key_values=past_key_values, top_k=top_k ) #(batch_size*num_beam , vocab_size)
+                
                 structured_batch_output = batch_output.reshape( ( inputs_ids.size(0) , -1 , self.vocab_size ) ).transpose(1 , 2) #(batch_size , vocab_size , num_beam)
 
                 new_inputs_ids , new_inputs_log_prob, extra_added_paddings = self.output_handeling( structured_batch_output , inputs_ids, 
@@ -677,7 +805,7 @@ class LLM_Word_Level_Ensemble:
                 # self.print_predictions( new_inputs_ids ,new_inputs_log_prob , starting_batch_input_len, extra_added_paddings)
                 # print('\n')
 
-                topk_object = torch.topk(-new_inputs_log_prob/(gen_text_len**0), k=num_beam , dim=-1 , largest=False )
+                topk_object = torch.topk(-new_inputs_log_prob/(gen_text_len**0.1), k=num_beam , dim=-1 , largest=False )
                 inputs_log_prob_divided = -topk_object.values # shape (batch_size , 1 , num_beam)
 
                 topk_indices = topk_object.indices.reshape( (topk_object.indices.size(0),topk_object.indices.size(-1)) )
@@ -699,25 +827,31 @@ class LLM_Word_Level_Ensemble:
                 eos_expanded_tensor = eos_tensor.expand( ( inputs_ids.size(dim=0) , -1 , num_beam ) ).to(self.device_list[0])
 
                 #To check if now we need to perform ensemble:
-                if all( torch.logical_or( torch.eq(inputs_ids[:,-1,:] , pad_expanded_tensor ).reshape((-1,)) , torch.eq(inputs_ids[:,-1,:] , eos_expanded_tensor ).reshape((-1,)) ) ): #if we reached to the start of a clause or the end of a sequence for all the sequences.
-                    print('performing ensemble!')
+                if all( torch.logical_or( torch.eq(inputs_ids[:,-1,:] , pad_expanded_tensor ).reshape((-1,)), torch.eq(inputs_ids[:,-1,:] , eos_expanded_tensor ).reshape((-1,))  ) ) or current_clause_length>=max_clause_len: #if we reached to the start of a clause or the end of a sequence for all the sequences.
+                    # print('performing ensemble!')
                     inputs_ids , inputs_log_prob = self.ensemble_bleu( inputs_ids , inputs_log_prob , starting_batch_input_len, extra_added_paddings )
-                    self.just_performed_ensemble = True
+                    just_performed_ensemble = True
                     past_key_values = None
+                    number_of_clauses+=1
+                    if all( torch.eq(inputs_ids[:,-1,:] , eos_expanded_tensor ).reshape((-1,)) ):
+                        should_continue = False
 
-                self.print_predictions( inputs_ids , inputs_log_prob , starting_batch_input_len, extra_added_paddings)
-                print('\n')
+                # self.print_predictions( inputs_ids , inputs_log_prob , starting_batch_input_len, extra_added_paddings)
+                # print('\n')
                 
-                if all( torch.eq(inputs_ids[:,-1,:] , eos_expanded_tensor ).reshape((-1,)) ) or (inputs_ids.size(1)-starting_batch_input_len>=max_num_token):
+                if (inputs_ids.size(1)-starting_batch_input_len>=max_num_token):
+                    # print('performing ensemble!')
                     should_continue = False
                     inputs_ids , inputs_log_prob = self.ensemble_bleu( inputs_ids , inputs_log_prob , starting_batch_input_len, extra_added_paddings )
-                else:
-                    should_continue = True
-            most_probable_gen_text = self.print_predictions( inputs_ids , inputs_log_prob , starting_batch_input_len, extra_added_paddings ,skip=True )
+                    number_of_clauses+=1
+
+            most_probable_gen_text, gen_text_len_list = self.print_predictions( inputs_ids , inputs_log_prob , starting_batch_input_len, extra_added_paddings ,skip=True )
             with open(log_file , 'a' ) as f:
                 f.write(f'\nThread_num:{thread_number} finished batch index: {index}\n')
                 f.write(f'{time.time()-start} \t gen_text_len:{inputs_ids.size(1)-starting_batch_input_len}\n')
                 f.write(f'\nThe chosen gen text:  {most_probable_gen_text}\n')
+                f.write(f'number_of_gen_tokens:  {gen_text_len_list}\n')
+                f.write(f'number_of_clauses:  {number_of_clauses}\n')
             del inputs_ids; del inputs_log_prob; del batch_output; #torch.cuda.empty_cache()
             print('The chosen gen text: ' , most_probable_gen_text, '\n')
             list_of_outputs.extend( most_probable_gen_text )
@@ -727,7 +861,7 @@ class LLM_Word_Level_Ensemble:
         print('\n')
         return list_of_outputs
         
-    def start_pipelines(self, batch_size , log_file , num_beam=1 , top_k=1 , max_num_token=200 ,  num_threads = 3 ):
+    def start_pipelines(self, batch_size , log_file , num_beam=1 , top_k=1 , max_num_token=300 ,  num_threads = 3 ):
         regular_thread_data_size = int(self.number_of_prompts/num_threads) * self.number_of_components
         thread_list = []
         init_output_list = self.get_predictions_form_logs( log_file , num_thread=num_threads) # this is for continuing any unfinished job. This will only work if the number of threads are equal to the number of threads used for the unifinished job
@@ -809,15 +943,24 @@ def send_notif(message):
 if __name__ == "__main__":
     # accelerator = Accelerator()
     opt = parse_option()
-    # send_notif('The job is started in manga-2:)')
+    # send_notif(f'{opt.output_file} is started in cedar:)')
     start_time = time.time()
     print(opt)
-    batch_size = opt.batch_size * 3
-    directory = './DAIL-SQL/dataset/process/'
-    dataset1 = 'SPIDER-TEST_SQL_0-SHOT_CTX-200_ANS-2048'
-    dataset2 = 'SPIDER-TEST_SQL_1-SHOT_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048_llama_7b'
-    dataset3 = 'SPIDER-TEST_SQL_3-SHOT_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048_llama_7b'
-    dataset_list = [dataset1 , dataset2 , dataset3]
+    # batch_size = opt.batch_size * 3
+    # directory = './DAIL-SQL/dataset/process/'
+    # dataset1 = 'SPIDER-TEST_SQL_0-SHOT_CTX-200_ANS-2048'
+    # dataset2 = 'SPIDER-TEST_SQL_1-SHOT_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048_llama_7b'
+    # dataset3 = 'SPIDER-TEST_SQL_3-SHOT_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048_llama_7b'
+    # dataset_list = [dataset1 , dataset2 , dataset3]
+
+    directory = './components/'
+    dataset1 = 'SPIDER-TEST_SQL_3-SHOT_0-3_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048.json'
+    dataset2 = 'SPIDER-TEST_SQL_3-SHOT_3-6_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048.json'
+    dataset3 = 'SPIDER-TEST_SQL_3-SHOT_6-9_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048.json'
+    dataset4 = 'SPIDER-TEST_SQL_3-SHOT_9-12_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048.json'
+    dataset5 = 'SPIDER-TEST_SQL_3-SHOT_12-15_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048.json'
+    dataset_list = [dataset1 , dataset2 , dataset3 , dataset4 , dataset5]
+    batch_size = opt.batch_size * len(dataset_list)
 
     word_ensemble = LLM_Word_Level_Ensemble( opt.model_name )#, opt.device , opt.other_device)
     word_ensemble.load_prompts_from_datasets(directory , dataset_list , 
@@ -828,5 +971,5 @@ if __name__ == "__main__":
     list_of_outputs = word_ensemble.start_pipelines( batch_size , opt.log_file, num_beam=opt.num_beam , top_k=opt.num_beam , num_threads = opt.thread_num)
     with open(opt.output_file , 'wb') as f:
         pkl.dump(list_of_outputs , f)
-    # send_notif(f'The task is done! output is being stored in manga-2 in{opt.output_file}\nProcess time:{time.time()-start_time}s')
+    # send_notif(f'**The task is done! output is being stored in cedar in{opt.output_file}\nProcess time:{time.time()-start_time}s')
 
