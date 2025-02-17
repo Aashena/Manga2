@@ -29,7 +29,7 @@ class LLM_Word_Level_Ensemble:
 
     def __init__(self, model_name ):
         # Initialize the model and the tokenizer.
-        seed=26
+        seed=25
         np.random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
@@ -71,7 +71,7 @@ class LLM_Word_Level_Ensemble:
             #torch tensor of shape(batch_size , length_of_sentences)
         #output: logits and next_cache
         with torch.no_grad():
-            attention_mask = (inputs != self.model.config.pad_token_id).type(torch.int64)
+            attention_mask = torch.logical_and(inputs != self.model.config.pad_token_id , inputs != self.model.config.eos_token_id).type(torch.int64)
             if past_key_values is not None:
                 inputs = inputs[: , -1:]
             model_output = self.model( inputs , attention_mask=attention_mask, 
@@ -167,16 +167,16 @@ class LLM_Word_Level_Ensemble:
         next_token_candidates_tensor[non_active_texts_index,:] = 0
         next_token_candidates_tensor[non_active_texts_index, self.tokenizer.eos_token_id ] = 1
         
-        topk_candidates_indexes = torch.topk(
-            next_token_candidates_tensor, k=top_k , dim=1 ).indices #shape( batch_size , top_k , num_beam)
+        # topk_candidates_indexes = torch.topk(
+        #     next_token_candidates_tensor, k=top_k , dim=1 ).indices #shape( batch_size , top_k , num_beam)
 
-        batch_indice_tensor = self.make_batch_indice_tensor(batch_size , top_k)
+        # batch_indice_tensor = self.make_batch_indice_tensor(batch_size , top_k)
 
-        masking_matrix = torch.zeros( ( next_token_candidates_tensor.size() ) ).to(self.device_list[-1])
-        masking_matrix[ batch_indice_tensor , topk_candidates_indexes ] = 1
+        # masking_matrix = torch.zeros( ( next_token_candidates_tensor.size() ) ).to(self.device_list[-1])
+        # masking_matrix[ batch_indice_tensor , topk_candidates_indexes ] = 1
         
         # Filter the token probabilities for the top k candidates.
-        topk_candidates_tensor_score = next_token_candidates_tensor * masking_matrix
+        topk_candidates_tensor_score = next_token_candidates_tensor# * masking_matrix
         
         del sentences; torch.cuda.empty_cache()
         return topk_candidates_tensor_score , past_key_values #first output shape (batch_size , vocab_size)
@@ -233,8 +233,8 @@ class LLM_Word_Level_Ensemble:
             #torch array containing the probability of top_k words in the ensembled vector: shape (number_of_ready_indexes_for_ensemble , top_k , num_beam)
 
         # ensembled_output_arrays = output_arrays[:,-1,:,:] # shape ( number_of_ready_indexes_for_ensemble , vocab_size , num_beam) to get the output of 3-shot
-        # ensembled_output_arrays = output_arrays.mean(dim=1) # to get the average of word predictions
-        ensembled_output_arrays = output_arrays.sum(dim=1) # to get the ebbs result
+        ensembled_output_arrays = output_arrays.mean(dim=1) # to get the average of word predictions
+        # ensembled_output_arrays = output_arrays.sum(dim=1) # to get the ebbs result
 
         return ensembled_output_arrays
 
@@ -371,14 +371,32 @@ class LLM_Word_Level_Ensemble:
             print('\n')
             print(inputs_ids.size())
             input_length = inputs_ids.size(1)
+
+            #block of code to replicate the original sampling
+            # token_ids_of_example_sql = self.tokenizer("SELECT * FROM tables ;")["input_ids"]
+            # print(token_ids_of_example_sql)
+            # if token_ids_of_example_sql[-1] == self.tokenizer.eos_token_id:
+            #     new_eos_token_id = token_ids_of_example_sql[-2]
+            # else:
+            #     new_eos_token_id = token_ids_of_example_sql[-1]
+            # self.model.config.eos_token_id = new_eos_token_id
+            # self.tokenizer.eos_token_id = new_eos_token_id
+            # print("new_eos_token_id:", new_eos_token_id)
+            # print("tokenizer.decode(new_eos_token_id): '{}'".format(self.tokenizer.decode(new_eos_token_id)))
+            # input_ids = self.tokenizer(batch[0] , truncation = False)["input_ids"]
+            # attention_mask = [1] * len(input_ids)
+            # inputs = {
+            #     "input_ids": torch.tensor([input_ids]).to(self.device_list[0]), # torch.int64
+            #     "attention_mask": torch.tensor([attention_mask]).to(self.device_list[0]) # torch.int64
+            # }
             # with torch.no_grad():
             #     generate_ids = self.model.generate(
-            #         inputs_ids.reshape(1,-1),
+            #         **inputs,
             #         max_new_tokens = 256,
             #         num_beams = 4,
             #         num_return_sequences = 4,
             #         use_cache = True,
-            #         eos_token_id = 2082
+            #         eos_token_id = new_eos_token_id,
             #     )
 
             # generated_sqls = self.tokenizer.batch_decode(generate_ids[:, input_length:], skip_special_tokens = True, clean_up_tokenization_spaces = False)
@@ -411,7 +429,7 @@ class LLM_Word_Level_Ensemble:
                 # self.print_predictions( new_inputs_ids ,new_inputs_log_prob/gen_text_len , starting_batch_input_len)
                 # print('\n')
 
-                topk_object = torch.topk(-new_inputs_log_prob/(gen_text_len**1), k=num_beam , dim=-1 , largest=False )
+                topk_object = torch.topk(-new_inputs_log_prob/(gen_text_len**0.5), k=num_beam , dim=-1 , largest=False )
                 inputs_log_prob_divided = -topk_object.values # shape (batch_size , 1 , num_beam)
                 topk_indices = topk_object.indices.reshape( (topk_object.indices.size(0),topk_object.indices.size(-1)) ).to('cpu')
                 
@@ -552,7 +570,7 @@ def send_notif(message):
 if __name__ == "__main__":
     # accelerator = Accelerator()
     opt = parse_option()
-    # send_notif('The job is started in manga-3:)')
+    send_notif('The job is started in manga-2:)')
     start_time = time.time()
     print(opt)
 
@@ -565,11 +583,16 @@ if __name__ == "__main__":
 
     directory = './components/'
     dataset1 = 'codes-1b_BIRD_table_num_5_column_num_6_5-shot_0-5_max_tokens_8192_max_new_tokens_256.json'
+    dataset2 = 'codes-1b_BIRD_table_num_5_column_num_6_5-shot_5-10_max_tokens_8192_max_new_tokens_256.json'
+    dataset3 = 'codes-1b_BIRD_table_num_5_column_num_6_5-shot_10-15_max_tokens_8192_max_new_tokens_256.json'
+    dataset4 = 'codes-1b_BIRD_table_num_5_column_num_6_5-shot_15-20_max_tokens_8192_max_new_tokens_256.json'
+    dataset5 = 'codes-1b_BIRD_table_num_5_column_num_6_5-shot_20-25_max_tokens_8192_max_new_tokens_256.json'
+    
     # dataset2 = 'SPIDER-TEST_SQL_3-SHOT_3-6_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048.json'
     # dataset3 = 'SPIDER-TEST_SQL_3-SHOT_6-9_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048.json'
     # dataset4 = 'SPIDER-TEST_SQL_3-SHOT_9-12_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048.json'
     # dataset5 = 'SPIDER-TEST_SQL_3-SHOT_12-15_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048.json'
-    dataset_list = [dataset1 ]#, dataset2 , dataset3 , dataset4 , dataset5]
+    dataset_list = [dataset1 , dataset2 , dataset3 , dataset4 , dataset5]
     batch_size = opt.batch_size * len(dataset_list)
 
     word_ensemble = LLM_Word_Level_Ensemble(opt.model_name)#, opt.device , opt.other_device)
@@ -589,5 +612,5 @@ if __name__ == "__main__":
         pkl.dump(list_of_starting_batch_input_len , f)
     with open(opt.output_file[:-4] + '_batch_text.pkl' , 'wb') as f:
         pkl.dump(list_of_batch_text , f)
-    # send_notif(f'The task is done! output is being stored in manga-3 in{opt.output_file}\nProcess time:{time.time()-start_time}s')
+    send_notif(f'The task is done! output is being stored in manga-2 in{opt.output_file}\nProcess time:{time.time()-start_time}s')
 
