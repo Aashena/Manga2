@@ -65,19 +65,22 @@ class LLM_Word_Level_Ensemble:
         
         return self.last_inputs.input_ids
     
-    def get_predictions(self, inputs , past_key_values=None):
+    def get_predictions(self, inputs , past_key_values_tensor=None):
         #performs the prediction on the tokenized sentences.
         #input:
             #torch tensor of shape(batch_size , length_of_sentences)
         #output: logits and next_cache
         with torch.no_grad():
             attention_mask = torch.logical_and(inputs != self.model.config.pad_token_id , inputs != self.model.config.eos_token_id).type(torch.int64)
-            if past_key_values is not None:
+            if past_key_values_tensor is not None:
                 inputs = inputs[: , -1:]
-            model_output = self.model( inputs , attention_mask=attention_mask, 
-            use_cache=True, return_dict=True, past_key_values=past_key_values )
+                model_output = self.model( inputs , attention_mask=attention_mask, 
+                use_cache=True, return_dict=True, past_key_values=torch.unbind(past_key_values_tensor,dim=0) )
+            else:
+                model_output = self.model( inputs , attention_mask=attention_mask, 
+                use_cache=True, return_dict=True, past_key_values=None )
 
-            return model_output['logits'][:,-1,:], model_output['past_key_values']
+            return model_output['logits'][:,-1,:], torch.stack( model_output['past_key_values'] )
 
     def replace_token_with_eos(self, token_id , indice_vector , prob_vector , change_prob=False):
         mask = (indice_vector!=token_id).type(torch.int64).to(indice_vector.device)
@@ -128,7 +131,7 @@ class LLM_Word_Level_Ensemble:
         return batch_indice_tensor
     
     
-    def get_next_word_score(self, sentences, past_key_values=None ,top_k=5):#operation_on_a_batch
+    def get_next_word_score(self, sentences, past_key_values_tensor=None ,top_k=5):#operation_on_a_batch
         # Getting the word probabilities for the next word. It will have the probability for the top-k words, and it will zero out the rest. If the top_k argument is set to -1 then it will return the whole probability distribution.
         #Input:
             #sentences: torch tensor of size(batch size, input_len).
@@ -142,44 +145,37 @@ class LLM_Word_Level_Ensemble:
         active_texts_index = torch.nonzero( last_tokens!=self.tokenizer.eos_token_id ).reshape( (-1,) ).to('cpu')
         non_active_texts_index = torch.nonzero( last_tokens==self.tokenizer.eos_token_id ).reshape( (-1,) ).to('cpu')
         
-        if past_key_values is not None:
-            tmp_past_key_values = []
-            for index, pkv in enumerate(past_key_values):
-                # print('pkv.size(): ' , pkv.size())
-                # print('active_texts_index.size(): ' , active_texts_index.size())
-                # print('active_texts_index: ' , active_texts_index)
-                tmp_past_key_values.append( pkv[active_texts_index , : , :] )
+        if past_key_values_tensor is not None:
+            tmp_past_key_values_tensor = past_key_values_tensor[ :, active_texts_index , : ,:]
         else:
-            tmp_past_key_values=None
+            tmp_past_key_values_tensor=None
 
         if active_texts_index.size(0)>0:
-            logits , tmp_past_key_values = self.get_predictions(sentences[active_texts_index,:] , 
-                                                            past_key_values= tmp_past_key_values) #shape(batch_size , vocab_size)
-            if past_key_values is not None:
-                for index, tpkv in enumerate(tmp_past_key_values):
-                    past_key_values[index] = torch.zeros( ( past_key_values[index].size(0) , 
-                                                            tpkv.size(1) , tpkv.size(2)) ,dtype=torch.float16 ).to(self.device_list[0])
-                    past_key_values[index][active_texts_index , : , :] = tpkv
-            else:
-                past_key_values = tmp_past_key_values
+            logits , tmp_past_key_values_tensor = self.get_predictions(sentences[active_texts_index,:] , 
+                                                            past_key_values_tensor= tmp_past_key_values_tensor) #shape(batch_size , vocab_size)
+            
+            past_key_values_tensor_size = (tmp_past_key_values_tensor.size(0), sentences.size(0), 
+                                           tmp_past_key_values_tensor.size(2), tmp_past_key_values_tensor.size(3) )
+            past_key_values_tensor = torch.zeros( past_key_values_tensor_size ,dtype=torch.float16 ).to(self.device_list[0])
+            past_key_values_tensor[: , active_texts_index , : , :] = tmp_past_key_values_tensor
 
             next_token_candidates_tensor[active_texts_index,:] = logits
         next_token_candidates_tensor[non_active_texts_index,:] = 0
         next_token_candidates_tensor[non_active_texts_index, self.tokenizer.eos_token_id ] = 1
         
-        # topk_candidates_indexes = torch.topk(
-        #     next_token_candidates_tensor, k=top_k , dim=1 ).indices #shape( batch_size , top_k , num_beam)
+        topk_candidates_indexes = torch.topk(
+            next_token_candidates_tensor, k=top_k , dim=1 ).indices #shape( batch_size , top_k , num_beam)
 
-        # batch_indice_tensor = self.make_batch_indice_tensor(batch_size , top_k)
+        batch_indice_tensor = self.make_batch_indice_tensor(batch_size , top_k)
 
-        # masking_matrix = torch.zeros( ( next_token_candidates_tensor.size() ) ).to(self.device_list[-1])
-        # masking_matrix[ batch_indice_tensor , topk_candidates_indexes ] = 1
+        masking_matrix = torch.zeros( ( next_token_candidates_tensor.size() ) ).to(self.device_list[-1])
+        masking_matrix[ batch_indice_tensor , topk_candidates_indexes ] = 1
         
         # Filter the token probabilities for the top k candidates.
-        topk_candidates_tensor_score = next_token_candidates_tensor# * masking_matrix
+        topk_candidates_tensor_score = next_token_candidates_tensor * masking_matrix
         
         del sentences; torch.cuda.empty_cache()
-        return topk_candidates_tensor_score , past_key_values #first output shape (batch_size , vocab_size)
+        return topk_candidates_tensor_score , past_key_values_tensor #first output shape (batch_size , vocab_size)
         
 
     # import os.path
@@ -403,7 +399,8 @@ class LLM_Word_Level_Ensemble:
             # for sql in generated_sqls:
             #     print('generated_sqls: ' , sql)
             #     print('------------------------')
-            past_key_values = None
+            past_key_values_tensor = None
+            is_first_token = True
             while should_continue:
                 gen_respond_len += 1
                 start_iteration = time.time()
@@ -415,7 +412,7 @@ class LLM_Word_Level_Ensemble:
             #     print( torchinfo.summary( self.model, input_data= inputs_ids_ready_infer ,batch_dim = 0, 
             # col_names = ('input_size', 'output_size', 'num_params', 'kernel_size', 'mult_adds'), device='cpu' , depth= 7) )
                 
-                batch_output , past_key_values = self.get_next_word_score( inputs_ids_ready_infer , past_key_values=past_key_values, top_k=top_k ) #(batch_size*num_beam , vocab_size)
+                batch_output , past_key_values_tensor = self.get_next_word_score( inputs_ids_ready_infer , past_key_values_tensor=past_key_values_tensor, top_k=top_k ) #(batch_size*num_beam , vocab_size)
 
                 structured_batch_output = batch_output.reshape( ( inputs_ids.size(0) , -1 , self.vocab_size ) ).transpose(1 , 2) #(batch_size , vocab_size , num_beam)
 
@@ -439,12 +436,14 @@ class LLM_Word_Level_Ensemble:
                 inputs_log_prob = new_inputs_log_prob[batch_indices,:,topk_indices].transpose( 1 , 2 ) #shape(batch_size , 1 , num_beam)
                 # print('past_key_values[0].size(): ' , past_key_values[0].size())
                 inputs_ids = new_inputs_ids[batch_indices,:,topk_indices].transpose( 1 , 2 ) #shape(batch_size , input_len , num_beam)
-                selected_beams_indice = ( (batch_indices * num_beam) + torch.remainder(topk_indices, num_beam) ).to(torch.int32).reshape((-1,))
+                if is_first_token:
+                    selected_beams_indice = ( ( batch_indices ) + (topk_indices/num_beam) ).to(torch.int32).reshape((-1,))
+                else:
+                    selected_beams_indice = ( (batch_indices * num_beam) + torch.remainder(topk_indices, num_beam) ).to(torch.int32).reshape((-1,))
                 # print('selected_beams_indice: ' , selected_beams_indice)
-                for index, pkv in enumerate(past_key_values):
-                    past_key_values[index] = torch.cat( [ pkv[ beam_idx:beam_idx+1 , : ,:  ] if beam_idx<pkv.size(0) else pkv[ -1: , : ,:  ] for beam_idx in selected_beams_indice ] , dim=0)
-                # print('past_key_values[0].size(): ' , past_key_values[0].size())
-                # print('----------------------------------------')
+                
+                past_key_values_tensor = past_key_values_tensor[: , selected_beams_indice , : , :]
+
                 del new_inputs_ids; del new_inputs_log_prob; #torch.cuda.empty_cache()
                 
                 # self.print_predictions( inputs_ids , inputs_log_prob , starting_batch_input_len)
@@ -460,6 +459,7 @@ class LLM_Word_Level_Ensemble:
                     should_continue = False
                 else:
                     should_continue = True
+                is_first_token = False
             most_probable_gen_text = self.print_predictions( inputs_ids , inputs_log_prob , starting_batch_input_len ,skip=True )
             list_of_input_ids.extend(inputs_ids)
             list_of_inputs_log_prob.extend(inputs_log_prob)
@@ -570,7 +570,7 @@ def send_notif(message):
 if __name__ == "__main__":
     # accelerator = Accelerator()
     opt = parse_option()
-    send_notif('The job is started in manga-2:)')
+    send_notif('The job is started in manga-3:)')
     start_time = time.time()
     print(opt)
 
@@ -612,5 +612,5 @@ if __name__ == "__main__":
         pkl.dump(list_of_starting_batch_input_len , f)
     with open(opt.output_file[:-4] + '_batch_text.pkl' , 'wb') as f:
         pkl.dump(list_of_batch_text , f)
-    send_notif(f'The task is done! output is being stored in manga-2 in{opt.output_file}\nProcess time:{time.time()-start_time}s')
+    send_notif(f'The task is done! output is being stored in manga-3 in{opt.output_file}\nProcess time:{time.time()-start_time}s')
 
