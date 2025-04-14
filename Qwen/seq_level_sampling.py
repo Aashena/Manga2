@@ -11,6 +11,8 @@ import time
 import inspect
 import ast
 
+
+
 #These lines are added for running "onekq-ai/OneSQL-v0.1-Qwen-32B"
 # from peft import PeftModel
 
@@ -87,6 +89,7 @@ class LLM_Word_Level_Ensemble:
             #length of the list containing all the prompts
         datasets_prompts_list = []
         for dataset in dataset_list:
+            self.comp_name = dataset
             prompt_list = []
             potential_cache_file_name = './ensemble_cache/' + dataset+'.pkl'
             if os.path.isfile(potential_cache_file_name):
@@ -129,7 +132,6 @@ class LLM_Word_Level_Ensemble:
         print(f'start_index:{start_index}, end_index={end_index}')
         list_of_outputs = []
         list_of_inputs_log_prob = []
-        list_of_batch_text = []
         if batch_size%self.number_of_components!=0:
             print('ERROR!!!: The batch_size should dividable by the number of components we have.')
             return
@@ -139,7 +141,7 @@ class LLM_Word_Level_Ensemble:
             data = self.all_prompts_in_1D[start_index : end_index]
         data_size = len(data)
         number_of_batches = int(data_size/batch_size)+int(data_size%batch_size>0)
-        
+
         for index in range( number_of_batches ):
             
             batch_index = index*batch_size
@@ -178,62 +180,100 @@ class LLM_Word_Level_Ensemble:
                     use_cache = True#,
                     #eos_token_id = self.semicolon_token_ids
                 )
+            # with torch.no_grad():
+            #     output = self.model.generate(
+            #         **inputs,
+            #         max_new_tokens=300,
+            #         do_sample = True,
+            #         num_return_sequences=num_beam,  # Return all beams
+            #         #length_penalty=0.5,
+            #         return_dict_in_generate=True,
+            #         output_scores=True,
+            #         use_cache = True#,
+            #         #eos_token_id = self.semicolon_token_ids
+            #     )
+
+            print(output.keys())
+            generated_tokens = output.sequences[:, inputs_len:]
+            most_probable_gen_text = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens = True)#, clean_up_tokenization_spaces = False)
             
-            most_probable_gen_text = self.tokenizer.batch_decode(output.sequences[:, inputs_len:], skip_special_tokens = True)#, clean_up_tokenization_spaces = False)
-            for sql , prb in zip(most_probable_gen_text, output.sequences_scores):
+            #This is when you do beam search
+            inputs_log_prob = output.sequences_scores
+
+            #This is when you do just sampling
+            # log_probs = [torch.log_softmax(score, dim=-1) for score in output.scores]
+            # all_logprobs = []
+            # # For each sequence, gather log-probs of generated tokens
+            # for seq_idx in range(output.sequences.shape[0]):  # total of batch_size * num_return_sequences
+            #     token_logprobs = [
+            #         log_probs[step_idx][seq_idx, token_id]
+            #         for step_idx, token_id in enumerate(generated_tokens[seq_idx])
+            #     ]
+            #     print(token_logprobs)
+            #     total_logprob = torch.stack(token_logprobs).sum().item()
+            #     all_logprobs.append(total_logprob)
+            # inputs_log_prob = torch.tensor(all_logprobs)
+
+            del output
+            for sql , prb in zip(most_probable_gen_text, inputs_log_prob):
                 print(f'prb: {prb.item()} generated_sqls: ' , sql)
                 print('------------------------')
-            inputs_log_prob = output.sequences_scores
+                
             print(inputs_log_prob.size())
             
-            list_of_inputs_log_prob.extend(inputs_log_prob)
-            list_of_batch_text.extend(batch)
+            list_of_inputs_log_prob.extend(inputs_log_prob.tolist())
+            # list_of_batch_text.extend(batch)
             
             with open(log_file , 'a' ) as f:
                 # f.write(f'\nThread_num:{thread_number} finished batch index: {index}\n')
                 f.write(f'{time.time()-start} \t gen_text_len:{inputs_len}\n')
                 # f.write(f'\nThe chosen gen text:  {most_probable_gen_text}\n')
+                # f.write(f'\nThe chosen log prob:  {inputs_log_prob.tolist()}\n')
             print('The chosen gen text: ' , most_probable_gen_text, '\n')
             list_of_outputs.extend( most_probable_gen_text )
         print(f'Thread Num: {thread_number}')
         for i in self.device_list:
             print(f'End of process | max {i}:  , {torch.cuda.max_memory_allocated(i)} ')
         # print('\n')
-        return list_of_outputs, list_of_inputs_log_prob, list_of_batch_text
+
+        return list_of_outputs, list_of_inputs_log_prob #, list_of_batch_text
         
     def start_pipelines(self, batch_size , log_file , num_beam=1 , top_k=1 , max_num_token=200 ,  num_threads = 3):
         regular_thread_data_size = int(self.number_of_prompts/num_threads) * self.number_of_components
         thread_list = []
-        init_output_list = self.get_predictions_form_logs( log_file , num_thread=num_threads) # this is for continuing any unfinished job. This will only work if the number of threads are equal to the number of threads used for the unifinished job
+        init_output_list, init_log_prb_lst = self.get_predictions_form_logs( log_file , num_thread=num_threads) # this is for continuing any unfinished job. This will only work if the number of threads are equal to the number of threads used for the unifinished job
         for i in range(num_threads):
-            num_processed_outputs = len(init_output_list[i])
+            num_processed_outputs = int(len(init_output_list[i])/num_beam) #Only if we have a batch size of one, since we are printing all the beams
             start_index = i * regular_thread_data_size
             if i == num_threads-1:
                 my_thread = ThreadWithReturnValue(target= self.pipeline_process , args = (batch_size , log_file , num_beam , top_k , max_num_token ,start_index + num_processed_outputs * self.number_of_components , -1 , i) )
             else:
-                my_thread = ThreadWithReturnValue(target= self.pipeline_process , args = (batch_size , log_file , num_beam , top_k , max_num_token , start_index + num_processed_outputs  * self.number_of_components , start_index + regular_thread_data_size , i ) )
+                my_thread = ThreadWithReturnValue(target= self.pipeline_process , args = (batch_size , log_file , num_beam , top_k , max_num_token , start_index + num_processed_outputs  * self.number_of_components , start_index + regular_thread_data_size , i) )
             thread_list.append(my_thread)
             my_thread.start()
+            time.sleep(5)
 
         list_of_outputs= []
         list_of_inputs_log_prob = []
-        list_of_batch_text = []
+        # list_of_batch_text = []
         for i , my_thread in enumerate(thread_list):
-            thread_output_list, thread_inputs_log_prob_list, thread_batch_text_list = my_thread.join()
+            thread_output_list, thread_inputs_log_prob_list = my_thread.join()
             init_output_list[i].extend(thread_output_list)
+            init_log_prb_lst[i].extend(thread_inputs_log_prob_list)
             
-            list_of_inputs_log_prob.extend(thread_inputs_log_prob_list)
-            list_of_batch_text.extend(thread_batch_text_list)
+            # list_of_batch_text.extend(thread_batch_text_list)
 
             list_of_outputs.extend(init_output_list[i])
+            list_of_inputs_log_prob.extend(init_log_prb_lst[i])
         
-        return list_of_outputs, list_of_inputs_log_prob, list_of_batch_text
+        return list_of_outputs, list_of_inputs_log_prob#, list_of_batch_text
         
     def get_predictions_form_logs(self , file_name , num_thread=10):
         #getting the output_seqs from logs:
         output_list = [ [] for i in range(num_thread) ]
+        log_prob_list = [ [] for i in range(num_thread) ]
         if os.path.isfile(file_name)==False:
-            return output_list
+            return output_list , log_prob_list
         
         with open(file_name , 'r') as f:
             lines = f.readlines()
@@ -242,17 +282,27 @@ class LLM_Word_Level_Ensemble:
             if line.startswith('Thread_num:'):
                 thread_index = int(line[11])
                 seen_thread = True
-            if seen_thread==True and line.startswith('The chosen gen text:  ['):
-                batch_list = ast.literal_eval(line[22:-1])
-                output_list[thread_index].extend(batch_list)
-                seen_thread=False
-                print('items in query:')
-                print(batch_list)
-                print('------------------------')
+            if seen_thread==True:
+                if line.startswith('The chosen gen text:  ['):
+                    batch_list = ast.literal_eval(line[22:-1])
+                    output_list[thread_index].extend(batch_list)
+                    # seen_thread=False
+                    print('items in query:')
+                    print(batch_list)
+                    print('------------------------')
+                elif line.startswith('The chosen log prob'):
+                    print('found probs!')
+                    log_probs = ast.literal_eval(line[22:-1])
+                    log_prob_list[thread_index].extend(log_probs)
+                    seen_thread=False
+                    print('log probs:')
+                    print(log_probs)
+                    print(type(log_probs[0]))
+                    print('------------------------')
         for index , thread in enumerate(output_list):
             print(f'{index}- {len(thread)}')
         
-        return output_list
+        return output_list, log_prob_list
         
 
 import argparse       
@@ -301,17 +351,24 @@ if __name__ == "__main__":
     # dataset_list = [dataset1 , dataset2 , dataset3]
 
     directory = './components/'
-    dataset1 = 'codes-1b_BIRD_table_num_5_column_num_6_5-shot_0-5_max_tokens_8192_max_new_tokens_256.json'
+    # dataset1 = 'codes-1b_BIRD_table_num_5_column_num_6_5-shot_0-5_max_tokens_8192_max_new_tokens_256.json'
     # dataset2 = 'codes-1b_BIRD_table_num_5_column_num_6_5-shot_5-10_max_tokens_8192_max_new_tokens_256.json'
     # dataset3 = 'codes-1b_BIRD_table_num_5_column_num_6_5-shot_10-15_max_tokens_8192_max_new_tokens_256.json'
     # dataset4 = 'codes-1b_BIRD_table_num_5_column_num_6_5-shot_15-20_max_tokens_8192_max_new_tokens_256.json'
     # dataset5 = 'codes-1b_BIRD_table_num_5_column_num_6_5-shot_20-25_max_tokens_8192_max_new_tokens_256.json'
+
+    dataset1 = 'codes-1b_BIRD_table_num_5_column_num_6_5-shot_0-5_wEvidence_max_tokens_8192_max_new_tokens_256.json'
+    # dataset2 = 'codes-1b_BIRD_table_num_5_column_num_6_5-shot_5-10_wEvidence_max_tokens_8192_max_new_tokens_256.json'
+    # dataset3 = 'codes-1b_BIRD_table_num_5_column_num_6_5-shot_10-15_wEvidence_max_tokens_8192_max_new_tokens_256.json'
+    # dataset4 = 'codes-1b_BIRD_table_num_5_column_num_6_5-shot_15-20_wEvidence_max_tokens_8192_max_new_tokens_256.json'
+    # dataset5 = 'codes-1b_BIRD_table_num_5_column_num_6_5-shot_20-25_wEvidence_max_tokens_8192_max_new_tokens_256.json'
     
     # dataset1 = 'SPIDER-TEST_SQL_3-SHOT_0-3_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048.json'
     # dataset2 = 'SPIDER-TEST_SQL_3-SHOT_3-6_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048.json'
     # dataset3 = 'SPIDER-TEST_SQL_3-SHOT_6-9_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048.json'
     # dataset4 = 'SPIDER-TEST_SQL_3-SHOT_9-12_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048.json'
     # dataset5 = 'SPIDER-TEST_SQL_3-SHOT_12-15_EUCDISMASKPRESKLSIMTHR_QA-EXAMPLE_CTX-200_ANS-2048.json'
+    
     dataset_list = [dataset1 ]#, dataset2 , dataset3 , dataset4 , dataset5]
     batch_size = opt.batch_size * len(dataset_list)
 
@@ -319,14 +376,13 @@ if __name__ == "__main__":
     word_ensemble.load_prompts_from_datasets(directory , dataset_list , 
                                              starting_index= opt.starting_index, 
                                              ending_index= opt.ending_index)
-    # list_of_outputs = word_ensemble.pipeline_process( batch_size , num_beam= opt.num_beam, 
-    #                                                  top_k = opt.num_beam )
-    list_of_outputs, list_of_inputs_log_prob, list_of_batch_text = word_ensemble.start_pipelines( batch_size , opt.log_file, num_beam=opt.num_beam , top_k=opt.num_beam , num_threads = opt.thread_num)
+    
+    list_of_outputs, list_of_inputs_log_prob = word_ensemble.start_pipelines( batch_size , opt.log_file, num_beam=opt.num_beam , top_k=opt.num_beam , num_threads = opt.thread_num )
     with open(opt.output_file , 'wb') as f:
         pkl.dump(list_of_outputs , f)
-    with open(opt.output_file[:-4] + '_input_ids.pkl' , 'wb') as f:
+    with open(opt.output_file[:-4] + '_inputs_log_prob.pkl' , 'wb') as f:
         pkl.dump(list_of_inputs_log_prob , f)
-    with open(opt.output_file[:-4] + '_batch_text.pkl' , 'wb') as f:
-        pkl.dump(list_of_batch_text , f)
+    # with open(opt.output_file[:-4] + '_batch_text.pkl' , 'wb') as f:
+    #     pkl.dump(list_of_batch_text , f)
     # send_notif(f'The task is done! output is being stored in manga-4 in{opt.output_file}\nProcess time:{time.time()-start_time}s')
 
