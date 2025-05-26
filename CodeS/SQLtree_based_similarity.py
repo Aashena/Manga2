@@ -13,14 +13,18 @@ def jaccard_similarity(set_1 , set_2):
     if union==0:
         return 1
     
-    return intersection / union
+    return (intersection+0.1) / (union+0.1)
 
 def generator_to_set(myGenerator):
     #It extracts the attribute .this for each element in the generator gotten from parse_one(query1).find_all(exp.Table/Column)
     mySet = set()
     myList = list(myGenerator)
     for i in myList:
-        mySet.add(i.this.this)
+        # print('i: ' , i)
+        # print('i.this: ' , i.this)
+        # print('i.this.this: ' , i.this.this)
+        if i is not None and i.this is not None and i.this.this is not None:
+            mySet.add(i.this.this)
     return mySet
 
 def combine_similarities(column_similarity, table_similarity , tree_similarity):
@@ -32,21 +36,12 @@ def get_most_similar_query(query_list):
     for i , query in enumerate(query_list):
         query = query.replace('`' , '"')
         try:
-            print('query: ', query)
             q_parsed = parse_one(query , error_level=ErrorLevel.IGNORE)
-            bfs_obj = q_parsed.bfs()
-            dfs_obj = q_parsed.bfs()
-            print('bfs:')
-            for node in bfs_obj:
-                print(node)
-            print('dfs:')
-            for node in dfs_obj:
-                print(node)
-            print('\n')
+
             valid_q_parsed_list.append(q_parsed)
             valid_query_list.append(query)
         except:
-            print('One of the queries are invalid: index = ' , i )
+            print('One of the queries are invalid: index = ' , i , query )
     if len(valid_query_list)==0:
         index = random.randint(0, len(query_list)-1)
         return query_list[index] , index
@@ -67,6 +62,41 @@ def get_most_similar_query(query_list):
         max_sim_index = sim_sum_list.index(max_sim)
         return valid_query_list[max_sim_index] , max_sim_index
     
+def sort_by_other_list(main_list, ref_list):
+    return [x for _, x in sorted( zip(ref_list, main_list), reverse=True )]
+
+def sort_queries(query_list):
+    valid_q_parsed_list = []
+    for i , query in enumerate(query_list):
+        query = query.replace('`' , '"')
+        try:
+            q_parsed = parse_one(query , error_level=ErrorLevel.IGNORE)
+
+            valid_q_parsed_list.append(q_parsed)
+        except:
+            print(f'One of the queries are invalid: index = {i}, query:{query}' )
+            valid_q_parsed_list.append(None)
+    sim_sum_list = []
+    for i in range(len(query_list)):
+        
+        if valid_q_parsed_list[i] is None:
+            sim_sum_list.append(0)
+        else: 
+            comparing_q_list = valid_q_parsed_list.copy()
+            comparing_query = comparing_q_list.pop(i)
+            sim_sum = 0
+            for q in comparing_q_list:
+                if q is not None:
+                    try:
+                        sim_sum += query_similarity( comparing_query , q )
+                    except:
+                        sim_sum += 0
+            sim_sum_list.append(sim_sum)
+
+    sorted_query_list = sort_by_other_list(query_list, sim_sum_list)
+    sorted_index_list = sort_by_other_list([i for i in range(len(query_list))], sim_sum_list)
+    return sorted_query_list, sorted_index_list
+
 def get_n_most_similar_query(query_list , n):
     output_query_list = []
     output_index_list = []
@@ -100,7 +130,7 @@ def query_similarity(q1_parsed , q2_parsed):
     number_of_keep = 0
     for i in diff_list:
         number_of_keep += int(isinstance( i , Keep ))
-    tree_similarity = number_of_keep/len(diff_list)
+    tree_similarity = ( number_of_keep+0.1 ) / ( len(diff_list) + 0.1)
     
     return combine_similarities( column_similarity , table_similarity , tree_similarity )
 
@@ -109,11 +139,10 @@ def unparsed_query_similarity(q1 , q2):
     q2 = q2.replace('`' , '"')
     try:
         q1_parsed = parse_one(q1 , error_level=ErrorLevel.IGNORE)
-        nodes = q1_parsed.bfs()
     
         q2_parsed = parse_one(q2 , error_level=ErrorLevel.IGNORE)
         
-        return math.log( query_similarity( q1_parsed , q2_parsed ) )
+        return query_similarity( q1_parsed , q2_parsed )
 
     except:
-        return -1000000
+        return 0
