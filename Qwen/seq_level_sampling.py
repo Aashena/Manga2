@@ -327,8 +327,8 @@ def parse_option():
 
 import requests
 def send_notif(message):
-    bot_token = "7490837017:AAGIuWfuP7OpdKN2o-cy6lyhnnsdL-1PRZo"
-    chat_id = "294248322"
+    bot_token = "bot_token"
+    chat_id = "chat_id"
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
